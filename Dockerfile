@@ -1,8 +1,7 @@
 ARG BUILD_FROM
 FROM $BUILD_FROM
 
-RUN apk add --no-cache python3 py3-pip && \
-    pip3 install --no-cache-dir aiohttp websockets
+RUN apk add --no-cache python3 py3-pip py3-aiohttp py3-websockets
 
 WORKDIR /app
 
