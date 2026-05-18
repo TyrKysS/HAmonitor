@@ -354,6 +354,26 @@ async def _call_ollama(
         return ""
 
 
+async def _ollama_background_task(
+    entity_id: str,
+    friendly: str,
+    domain: str,
+    prev_val: str,
+    new_val: str,
+    unit: str,
+    score: int,
+    label: str,
+    reason: str,
+    timestamp: str,
+) -> None:
+    """Fire-and-forget wrapper: calls Ollama and logs the result when ready."""
+    explanation = await _call_ollama(
+        entity_id, friendly, domain, prev_val, new_val, unit, score, label, reason
+    )
+    if explanation:
+        log(f"[LLM] {timestamp} {friendly}: {explanation}")
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -516,14 +536,6 @@ class HAMonitor:
         if score < SCORE_MIN_THRESHOLD:
             return
 
-        llm_explanation = ""
-        if OLLAMA_ENABLED and score >= OLLAMA_SCORE_THRESHOLD:
-            llm_explanation = await _call_ollama(
-                entity_id, friendly, domain, prev_val, new_val, unit, score, label, reason
-            )
-            if llm_explanation and LOG_STDOUT:
-                log(f"[LLM] {llm_explanation}")
-
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
         row = {
@@ -538,13 +550,18 @@ class HAMonitor:
             "score_label": label,
             "score_reason": reason,
             "annotation": "",
-            "llm_explanation": llm_explanation,
+            "llm_explanation": "",
         }
 
         append_row(row)
 
         if LOG_STDOUT:
             log(describe_change(friendly, entity_id, prev_val, new_val, unit, score, label, reason))
+
+        if OLLAMA_ENABLED and score >= OLLAMA_SCORE_THRESHOLD:
+            asyncio.create_task(_ollama_background_task(
+                entity_id, friendly, domain, prev_val, new_val, unit, score, label, reason, timestamp
+            ))
 
 
 # ---------------------------------------------------------------------------
