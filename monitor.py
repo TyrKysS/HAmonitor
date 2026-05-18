@@ -332,7 +332,7 @@ async def _call_ollama(
             "Use the concrete state values. Reply with this sentence only, no other text."
         )
 
-    timeout = aiohttp.ClientTimeout(total=15)
+    timeout = aiohttp.ClientTimeout(total=60)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(
