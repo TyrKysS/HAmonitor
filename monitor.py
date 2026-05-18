@@ -426,8 +426,30 @@ async def _fetch_ha_states(domains: set[str]) -> list[dict]:
         return []
 
 
+# Whitelist of services the LLM is allowed to call — prevents hallucinated service names.
+_ALLOWED_LLM_SERVICES = {
+    "homeassistant.turn_on",
+    "homeassistant.turn_off",
+    "climate.turn_on",
+    "climate.turn_off",
+    "input_boolean.turn_on",
+    "input_boolean.turn_off",
+    "switch.turn_on",
+    "switch.turn_off",
+    "input_number.set_value",
+}
+
+# Default "turn off" service per domain shown as a hint in the prompt.
+_DOMAIN_OFF_SERVICE = {
+    "climate": "climate.turn_off",
+    "input_boolean": "input_boolean.turn_off",
+    "switch": "switch.turn_off",
+    "input_number": "homeassistant.turn_off",
+}
+
+
 async def _ask_llm_for_actions(
-    entity_id: str,
+    trigger_entity_id: str,
     friendly: str,
     prev_val: str,
     new_val: str,
@@ -436,43 +458,52 @@ async def _ask_llm_for_actions(
 ) -> list[dict]:
     """Ask Ollama which entities (if any) should be controlled in response to this event.
 
-    Returns a list of dicts with keys: entity_id, service, service_data (optional).
-    Returns [] on any error or when no action is needed.
+    Returns validated list of dicts {entity_id, service}.  Returns [] on any error.
     """
-    valid_ids = {s["entity_id"] for s in available}
+    # Exclude the triggering entity — it must not be an action target.
+    candidates = [s for s in available if s["entity_id"] != trigger_entity_id]
+    if not candidates:
+        return []
+
+    valid_ids = {s["entity_id"] for s in candidates}
 
     lines = []
-    for s in available:
+    for s in candidates:
+        dom = s["entity_id"].split(".")[0]
         fn = s.get("attributes", {}).get("friendly_name") or s["entity_id"]
-        lines.append(f"  {s['entity_id']} | {fn} | stav: {s['state']}")
-    entity_list = "\n".join(lines)
+        hint = _DOMAIN_OFF_SERVICE.get(dom, "homeassistant.turn_off")
+        if OLLAMA_LANGUAGE == "cs":
+            lines.append(f'  {{"entity_id": "{s["entity_id"]}", "service": "{hint}"}}  # {fn}, stav: {s["state"]}')
+        else:
+            lines.append(f'  {{"entity_id": "{s["entity_id"]}", "service": "{hint}"}}  # {fn}, state: {s["state"]}')
+    entity_lines = "\n".join(lines)
 
     if OLLAMA_LANGUAGE == "cs":
         prompt = (
             f"Událost v Home Assistant:\n"
-            f"  Entita: {friendly} ({entity_id})\n"
+            f"  Entita: {friendly} ({trigger_entity_id})\n"
             f"  Změna stavu: '{prev_val}' → '{new_val}'\n"
             f"  Důvod: {score_reason}\n\n"
-            f"Dostupné ovladatelné entity:\n{entity_list}\n\n"
-            "Úkol: Pokud tato událost vyžaduje ovládání některé entity (např. vypnutí termostatu "
-            "nebo vytápění po otevření okna), odpověz POUZE platným JSON polem. Každá akce má klíče "
-            "\"entity_id\" a \"service\" (ve formátu \"doména.služba\"). Příklad:\n"
-            '[{"entity_id": "climate.obyvak", "service": "climate.turn_off"}]\n'
-            "Pokud akce není potřeba, odpověz: []\n"
-            "Odpovídej VÝHRADNĚ JSON bez jakéhokoliv dalšího textu."
+            f"Ovladatelné entity (každá je zapsaná jako připravená JSON akce):\n{entity_lines}\n\n"
+            "Úkol: Vyber jen ty entity, které je potřeba ovládat kvůli výše uvedené události "
+            "(např. vypnout termostat nebo vytápění po otevření okna). "
+            "Zkopíruj příslušné akce beze změny a vrať JEN platné JSON pole. "
+            "Pokud akce není potřeba, vrať: []\n"
+            "NIKDY neměň hodnoty 'entity_id' ani 'service'. "
+            "Odpovídej VÝHRADNĚ JSON bez dalšího textu."
         )
     else:
         prompt = (
             f"Home Assistant event:\n"
-            f"  Entity: {friendly} ({entity_id})\n"
+            f"  Entity: {friendly} ({trigger_entity_id})\n"
             f"  State change: '{prev_val}' → '{new_val}'\n"
             f"  Reason: {score_reason}\n\n"
-            f"Controllable entities:\n{entity_list}\n\n"
-            "Task: If this event requires controlling any entity (e.g. turning off a thermostat "
-            "or heating after a window opens), reply ONLY with a valid JSON array. Each action has "
-            "keys \"entity_id\" and \"service\" (format \"domain.service\"). Example:\n"
-            '[{"entity_id": "climate.living_room", "service": "climate.turn_off"}]\n'
-            "If no action is needed, reply: []\n"
+            f"Controllable entities (each written as a ready-to-use JSON action):\n{entity_lines}\n\n"
+            "Task: Select only the entities that need to be controlled because of the event above "
+            "(e.g. turn off a thermostat or heating after a window opens). "
+            "Copy the relevant actions unchanged and return ONLY a valid JSON array. "
+            "If no action is needed, return: []\n"
+            "NEVER change the 'entity_id' or 'service' values. "
             "Reply EXCLUSIVELY with JSON, no other text."
         )
 
@@ -490,30 +521,39 @@ async def _ask_llm_for_actions(
                 raw = data.get("response", "").strip()
                 # Strip optional markdown fences
                 if "```" in raw:
-                    raw = raw.split("```")[1]
+                    parts = raw.split("```")
+                    raw = parts[1] if len(parts) > 1 else parts[0]
                     if raw.startswith("json"):
                         raw = raw[4:]
                     raw = raw.strip()
+                # Extract first JSON array if LLM added prose around it
+                start = raw.find("[")
+                end = raw.rfind("]")
+                if start != -1 and end != -1:
+                    raw = raw[start:end + 1]
                 actions = json.loads(raw)
-                # Validate: only allow entity_ids that actually exist in HA
-                validated = [
-                    a for a in actions
-                    if isinstance(a, dict)
-                    and a.get("entity_id") in valid_ids
-                    and isinstance(a.get("service"), str)
-                    and "." in a["service"]
-                ]
-                if len(validated) < len(actions):
-                    log(f"LLM actions: {len(actions) - len(validated)} action(s) dropped (unknown entity_id)")
+                validated = []
+                for a in actions:
+                    if not isinstance(a, dict):
+                        continue
+                    eid = a.get("entity_id", "")
+                    svc = a.get("service", "")
+                    if eid not in valid_ids:
+                        log(f"LLM actions: dropped '{eid}' — not in available entities")
+                        continue
+                    if svc not in _ALLOWED_LLM_SERVICES:
+                        log(f"LLM actions: dropped service '{svc}' — not in allowed list")
+                        continue
+                    validated.append({"entity_id": eid, "service": svc})
                 return validated
     except (json.JSONDecodeError, ValueError) as exc:
         log(f"LLM actions: could not parse Ollama response as JSON: {exc}")
         return []
     except asyncio.TimeoutError:
-        log(f"LLM actions: Ollama timeout for {entity_id}")
+        log(f"LLM actions: Ollama timeout for {trigger_entity_id}")
         return []
     except Exception as exc:
-        log(f"LLM actions: error for {entity_id}: {exc}")
+        log(f"LLM actions: error for {trigger_entity_id}: {exc}")
         return []
 
 
