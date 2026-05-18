@@ -520,6 +520,8 @@ class HAMonitor:
             llm_explanation = await _call_ollama(
                 entity_id, friendly, domain, prev_val, new_val, unit, score, label, reason
             )
+            if llm_explanation and LOG_STDOUT:
+                log(f"[LLM] {llm_explanation}")
 
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
