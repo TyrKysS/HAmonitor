@@ -35,6 +35,12 @@ OUTPUT_DIR: Path = Path(os.environ.get("MONITOR_OUTPUT_DIR", "/share/ha_monitor"
 LOG_STDOUT: bool = os.environ.get("MONITOR_LOG_STDOUT", "true").lower() == "true"
 SCORE_MIN_THRESHOLD: int = int(os.environ.get("MONITOR_SCORE_MIN_THRESHOLD", "0"))
 
+OLLAMA_ENABLED: bool = os.environ.get("MONITOR_OLLAMA_ENABLED", "false").lower() == "true"
+OLLAMA_URL: str = os.environ.get("MONITOR_OLLAMA_URL", "http://localhost:11434").rstrip("/")
+OLLAMA_MODEL: str = os.environ.get("MONITOR_OLLAMA_MODEL", "llama3.2:3b")
+OLLAMA_SCORE_THRESHOLD: int = int(os.environ.get("MONITOR_OLLAMA_SCORE_THRESHOLD", "7"))
+OLLAMA_LANGUAGE: str = os.environ.get("MONITOR_OLLAMA_LANGUAGE", "cs")
+
 _raw_domains = os.environ.get("MONITOR_DOMAINS", '["sensor","binary_sensor"]')
 try:
     WATCHED_DOMAINS: set[str] = set(json.loads(_raw_domains))
@@ -53,6 +59,7 @@ CSV_HEADER = [
     "score_label",
     "score_reason",
     "annotation",
+    "llm_explanation",
 ]
 
 # ---------------------------------------------------------------------------
@@ -265,6 +272,88 @@ def score_change(
 
 
 # ---------------------------------------------------------------------------
+# Ollama LLM explanation
+# ---------------------------------------------------------------------------
+
+async def _fetch_ollama_models() -> list[str]:
+    """Return model names available on the configured Ollama instance."""
+    timeout = aiohttp.ClientTimeout(total=10)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(f"{OLLAMA_URL}/api/tags") as resp:
+                if resp.status != 200:
+                    log(f"Ollama /api/tags returned HTTP {resp.status}")
+                    return []
+                data = await resp.json()
+                return [m["name"] for m in data.get("models", [])]
+    except asyncio.TimeoutError:
+        log("Ollama /api/tags timed out — is the URL correct?")
+        return []
+    except Exception as exc:
+        log(f"Ollama /api/tags error: {exc}")
+        return []
+
+
+async def _call_ollama(
+    entity_id: str,
+    friendly: str,
+    domain: str,
+    prev_val: str,
+    new_val: str,
+    unit: str,
+    score: int,
+    label: str,
+    reason: str,
+) -> str:
+    """Ask Ollama to produce a one-sentence human-readable description of the event.
+
+    Returns an empty string on any error or timeout so callers can proceed safely.
+    """
+    unit_str = f" {unit}" if unit else ""
+
+    if OLLAMA_LANGUAGE == "cs":
+        prompt = (
+            f"Entita: {friendly} ({entity_id})\n"
+            f"Doména: {domain}\n"
+            f"Předchozí stav: {prev_val}{unit_str}\n"
+            f"Nový stav: {new_val}{unit_str}\n"
+            f"Hodnocení: {score}/10 ({label}) – {reason}\n\n"
+            "Napiš jednu větu v češtině, která přirozeně popisuje, co se právě stalo. "
+            "Použij konkrétní hodnoty stavů. Odpovídej pouze touto větou, bez dalšího textu."
+        )
+    else:
+        prompt = (
+            f"Entity: {friendly} ({entity_id})\n"
+            f"Domain: {domain}\n"
+            f"Previous state: {prev_val}{unit_str}\n"
+            f"New state: {new_val}{unit_str}\n"
+            f"Score: {score}/10 ({label}) – {reason}\n\n"
+            "Write one sentence in English that naturally describes what just happened. "
+            "Use the concrete state values. Reply with this sentence only, no other text."
+        )
+
+    timeout = aiohttp.ClientTimeout(total=15)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                f"{OLLAMA_URL}/api/generate",
+                json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
+            ) as resp:
+                if resp.status != 200:
+                    log(f"Ollama HTTP {resp.status} for {entity_id}")
+                    return ""
+                data = await resp.json()
+                explanation = data.get("response", "").strip()
+                return explanation.replace("\n", " ").replace("\r", "")[:500]
+    except asyncio.TimeoutError:
+        log(f"Ollama timeout for {entity_id}")
+        return ""
+    except Exception as exc:
+        log(f"Ollama error for {entity_id}: {exc}")
+        return ""
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -338,6 +427,17 @@ class HAMonitor:
         log(f"Watching domains: {sorted(WATCHED_DOMAINS)}")
         log(f"Output directory: {OUTPUT_DIR}")
         log(f"Score threshold: {SCORE_MIN_THRESHOLD} (recording changes with score >= {SCORE_MIN_THRESHOLD})")
+        if OLLAMA_ENABLED:
+            log(f"Ollama enabled: {OLLAMA_URL}  model={OLLAMA_MODEL}  threshold={OLLAMA_SCORE_THRESHOLD}  lang={OLLAMA_LANGUAGE}")
+            available = await _fetch_ollama_models()
+            if available:
+                log(f"Ollama available models: {', '.join(available)}")
+                if OLLAMA_MODEL not in available:
+                    log(f"WARNING: configured model '{OLLAMA_MODEL}' not found — LLM explanations will fail until the model is pulled or the config is updated")
+            else:
+                log("WARNING: could not reach Ollama — LLM explanations will be skipped until the connection is restored")
+        else:
+            log("Ollama disabled (set ollama_enabled: true to activate LLM explanations)")
 
         backoff = 5
         while True:
@@ -415,6 +515,12 @@ class HAMonitor:
         if score < SCORE_MIN_THRESHOLD:
             return
 
+        llm_explanation = ""
+        if OLLAMA_ENABLED and score >= OLLAMA_SCORE_THRESHOLD:
+            llm_explanation = await _call_ollama(
+                entity_id, friendly, domain, prev_val, new_val, unit, score, label, reason
+            )
+
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
         row = {
@@ -429,6 +535,7 @@ class HAMonitor:
             "score_label": label,
             "score_reason": reason,
             "annotation": "",
+            "llm_explanation": llm_explanation,
         }
 
         append_row(row)

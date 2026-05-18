@@ -36,6 +36,7 @@ Columns written by `monitor.py`:
 - `score_label` — human-readable tier (Negligible / Low / Moderate / Significant / High / Critical)
 - `score_reason` — one-line explanation of how the score was derived
 - `annotation` (intentionally left empty for manual annotation later)
+- `llm_explanation` — natural-language sentence from Ollama; empty when Ollama is disabled or score < `ollama_score_threshold`
 
 ## Scoring engine
 `score_change()` in `monitor.py` assigns scores based on domain, entity keywords, and numeric delta:
@@ -57,6 +58,11 @@ Configured in `config.yaml` options:
 - `output_dir` (default: `/share/ha_monitor`)
 - `log_to_stdout` (boolean)
 - `score_min_threshold` (integer 0–10, default `0`; events with score below this are silently dropped)
+- `ollama_enabled` (boolean, default `false`)
+- `ollama_url` (default `http://localhost:11434` — URL of the Ollama add-on API)
+- `ollama_model` (default `llama3.2:3b`)
+- `ollama_score_threshold` (integer 0–10, default `7`; only events with score ≥ this trigger an LLM call)
+- `ollama_language` (default `cs`; use `en` for English explanations)
 
 Environment variables consumed by `monitor.py`:
 - `HA_TOKEN`
@@ -64,6 +70,11 @@ Environment variables consumed by `monitor.py`:
 - `MONITOR_OUTPUT_DIR`
 - `MONITOR_LOG_STDOUT`
 - `MONITOR_SCORE_MIN_THRESHOLD`
+- `MONITOR_OLLAMA_ENABLED`
+- `MONITOR_OLLAMA_URL`
+- `MONITOR_OLLAMA_MODEL`
+- `MONITOR_OLLAMA_SCORE_THRESHOLD`
+- `MONITOR_OLLAMA_LANGUAGE`
 
 ## Implementation notes
 - Ignore attribute-only updates (`prev_val == new_val`).

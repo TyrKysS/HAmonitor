@@ -1,6 +1,6 @@
 name: "HA Monitor"
 description: "Monitors state changes of all entities and logs them to a CSV file for easy export and annotation."
-version: "1.0.0"
+version: "1.1.0"
 slug: "ha_monitor"
 url: "https://github.com/your-repo/ha_monitor"
 init: false
@@ -31,9 +31,19 @@ options:
   output_dir: "/share/ha_monitor"
   log_to_stdout: true
   score_min_threshold: 0
+  ollama_enabled: false
+  ollama_url: "http://localhost:11434"
+  ollama_model: "llama3.2:3b"
+  ollama_score_threshold: 7
+  ollama_language: "cs"
 schema:
   domains:
     - str
   output_dir: str
   log_to_stdout: bool
   score_min_threshold: int
+  ollama_enabled: bool
+  ollama_url: str
+  ollama_model: str
+  ollama_score_threshold: int
+  ollama_language: str
