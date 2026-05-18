@@ -36,10 +36,10 @@ LOG_STDOUT: bool = os.environ.get("MONITOR_LOG_STDOUT", "true").lower() == "true
 SCORE_MIN_THRESHOLD: int = int(os.environ.get("MONITOR_SCORE_MIN_THRESHOLD", "0"))
 
 OLLAMA_ENABLED: bool = os.environ.get("MONITOR_OLLAMA_ENABLED", "false").lower() == "true"
-OLLAMA_URL: str = os.environ.get("MONITOR_OLLAMA_URL", "http://localhost:11434").rstrip("/")
-OLLAMA_MODEL: str = os.environ.get("MONITOR_OLLAMA_MODEL", "llama3.2:3b")
-OLLAMA_SCORE_THRESHOLD: int = int(os.environ.get("MONITOR_OLLAMA_SCORE_THRESHOLD", "7"))
-OLLAMA_LANGUAGE: str = os.environ.get("MONITOR_OLLAMA_LANGUAGE", "cs")
+OLLAMA_URL: str = os.environ.get("MONITOR_OLLAMA_URL", "http://localhost:11434").strip().rstrip("/")
+OLLAMA_MODEL: str = os.environ.get("MONITOR_OLLAMA_MODEL", "llama3.2:3b").strip()
+OLLAMA_SCORE_THRESHOLD: int = int(os.environ.get("MONITOR_OLLAMA_SCORE_THRESHOLD", "7").strip())
+OLLAMA_LANGUAGE: str = os.environ.get("MONITOR_OLLAMA_LANGUAGE", "cs").strip()
 
 _raw_domains = os.environ.get("MONITOR_DOMAINS", '["sensor","binary_sensor"]')
 try:
