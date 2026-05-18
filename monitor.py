@@ -340,7 +340,8 @@ async def _call_ollama(
                 json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
             ) as resp:
                 if resp.status != 200:
-                    log(f"Ollama HTTP {resp.status} for {entity_id}")
+                    body = (await resp.text())[:300]
+                    log(f"Ollama HTTP {resp.status} for {entity_id}: {body}")
                     return ""
                 data = await resp.json()
                 explanation = data.get("response", "").strip()
