@@ -23,4 +23,12 @@ export MONITOR_OLLAMA_MODEL="${OLLAMA_MODEL}"
 export MONITOR_OLLAMA_SCORE_THRESHOLD="${OLLAMA_SCORE_THRESHOLD}"
 export MONITOR_OLLAMA_LANGUAGE="${OLLAMA_LANGUAGE}"
 
+AUTOMATIONS=$(bashio::config 'automations')
+export MONITOR_AUTOMATIONS="${AUTOMATIONS}"
+
+LLM_ACTIONS_ENABLED=$(bashio::config 'llm_actions_enabled')
+LLM_ACTIONS_DOMAINS=$(bashio::config 'llm_actions_domains')
+export MONITOR_LLM_ACTIONS_ENABLED="${LLM_ACTIONS_ENABLED}"
+export MONITOR_LLM_ACTIONS_DOMAINS="${LLM_ACTIONS_DOMAINS}"
+
 python3 /app/monitor.py

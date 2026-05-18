@@ -41,6 +41,21 @@ OLLAMA_MODEL: str = os.environ.get("MONITOR_OLLAMA_MODEL", "llama3.2:3b").strip(
 OLLAMA_SCORE_THRESHOLD: int = int(os.environ.get("MONITOR_OLLAMA_SCORE_THRESHOLD", "7").strip())
 OLLAMA_LANGUAGE: str = os.environ.get("MONITOR_OLLAMA_LANGUAGE", "cs").strip()
 
+HA_REST_URL: str = "http://supervisor/core/api"
+
+_raw_automations = os.environ.get("MONITOR_AUTOMATIONS", "[]")
+try:
+    AUTOMATIONS: list[dict] = json.loads(_raw_automations) if _raw_automations.strip() else []
+except json.JSONDecodeError:
+    AUTOMATIONS = []
+
+LLM_ACTIONS_ENABLED: bool = os.environ.get("MONITOR_LLM_ACTIONS_ENABLED", "false").lower() == "true"
+_raw_llm_domains = os.environ.get("MONITOR_LLM_ACTIONS_DOMAINS", '["climate","input_boolean","switch","input_number"]')
+try:
+    LLM_ACTIONS_DOMAINS: set[str] = set(json.loads(_raw_llm_domains))
+except json.JSONDecodeError:
+    LLM_ACTIONS_DOMAINS = {"climate", "input_boolean", "switch", "input_number"}
+
 _raw_domains = os.environ.get("MONITOR_DOMAINS", '["sensor","binary_sensor"]')
 try:
     WATCHED_DOMAINS: set[str] = set(json.loads(_raw_domains))
@@ -332,7 +347,7 @@ async def _call_ollama(
             "Use the concrete state values. Reply with this sentence only, no other text."
         )
 
-    timeout = aiohttp.ClientTimeout(total=60)
+    timeout = aiohttp.ClientTimeout(total=120)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(
@@ -354,6 +369,154 @@ async def _call_ollama(
         return ""
 
 
+async def _call_ha_service(service: str, target: str, extra_data: str) -> None:
+    """Call a HA service via the Supervisor REST API."""
+    if "." not in service:
+        log(f"Automation: invalid action_service '{service}' (expected 'domain.service')")
+        return
+    domain, service_name = service.split(".", 1)
+    url = f"{HA_REST_URL}/services/{domain}/{service_name}"
+
+    body: dict = {}
+    if target:
+        body["entity_id"] = target
+    if extra_data:
+        try:
+            body.update(json.loads(extra_data))
+        except json.JSONDecodeError:
+            log(f"Automation: invalid action_data JSON for {service}: {extra_data!r}")
+            return
+
+    headers = {"Authorization": f"Bearer {HA_TOKEN}"}
+    timeout = aiohttp.ClientTimeout(total=10)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, json=body, headers=headers) as resp:
+                if resp.status in (200, 201):
+                    log(f"Automation: {service} on '{target or '(no target)'}' → OK")
+                else:
+                    body_text = (await resp.text())[:200]
+                    log(f"Automation: {service} failed HTTP {resp.status}: {body_text}")
+    except asyncio.TimeoutError:
+        log(f"Automation: timeout calling {service}")
+    except Exception as exc:
+        log(f"Automation: error calling {service}: {exc}")
+
+
+async def _fetch_ha_states(domains: set[str]) -> list[dict]:
+    """Return HA states filtered to the given domains."""
+    headers = {"Authorization": f"Bearer {HA_TOKEN}"}
+    timeout = aiohttp.ClientTimeout(total=10)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(f"{HA_REST_URL}/states", headers=headers) as resp:
+                if resp.status != 200:
+                    log(f"LLM actions: /api/states returned HTTP {resp.status}")
+                    return []
+                all_states = await resp.json()
+                return [
+                    s for s in all_states
+                    if s.get("entity_id", "").split(".")[0] in domains
+                ]
+    except asyncio.TimeoutError:
+        log("LLM actions: /api/states timed out")
+        return []
+    except Exception as exc:
+        log(f"LLM actions: /api/states error: {exc}")
+        return []
+
+
+async def _ask_llm_for_actions(
+    entity_id: str,
+    friendly: str,
+    prev_val: str,
+    new_val: str,
+    score_reason: str,
+    available: list[dict],
+) -> list[dict]:
+    """Ask Ollama which entities (if any) should be controlled in response to this event.
+
+    Returns a list of dicts with keys: entity_id, service, service_data (optional).
+    Returns [] on any error or when no action is needed.
+    """
+    valid_ids = {s["entity_id"] for s in available}
+
+    lines = []
+    for s in available:
+        fn = s.get("attributes", {}).get("friendly_name") or s["entity_id"]
+        lines.append(f"  {s['entity_id']} | {fn} | stav: {s['state']}")
+    entity_list = "\n".join(lines)
+
+    if OLLAMA_LANGUAGE == "cs":
+        prompt = (
+            f"Událost v Home Assistant:\n"
+            f"  Entita: {friendly} ({entity_id})\n"
+            f"  Změna stavu: '{prev_val}' → '{new_val}'\n"
+            f"  Důvod: {score_reason}\n\n"
+            f"Dostupné ovladatelné entity:\n{entity_list}\n\n"
+            "Úkol: Pokud tato událost vyžaduje ovládání některé entity (např. vypnutí termostatu "
+            "nebo vytápění po otevření okna), odpověz POUZE platným JSON polem. Každá akce má klíče "
+            "\"entity_id\" a \"service\" (ve formátu \"doména.služba\"). Příklad:\n"
+            '[{"entity_id": "climate.obyvak", "service": "climate.turn_off"}]\n'
+            "Pokud akce není potřeba, odpověz: []\n"
+            "Odpovídej VÝHRADNĚ JSON bez jakéhokoliv dalšího textu."
+        )
+    else:
+        prompt = (
+            f"Home Assistant event:\n"
+            f"  Entity: {friendly} ({entity_id})\n"
+            f"  State change: '{prev_val}' → '{new_val}'\n"
+            f"  Reason: {score_reason}\n\n"
+            f"Controllable entities:\n{entity_list}\n\n"
+            "Task: If this event requires controlling any entity (e.g. turning off a thermostat "
+            "or heating after a window opens), reply ONLY with a valid JSON array. Each action has "
+            "keys \"entity_id\" and \"service\" (format \"domain.service\"). Example:\n"
+            '[{"entity_id": "climate.living_room", "service": "climate.turn_off"}]\n'
+            "If no action is needed, reply: []\n"
+            "Reply EXCLUSIVELY with JSON, no other text."
+        )
+
+    timeout = aiohttp.ClientTimeout(total=120)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                f"{OLLAMA_URL}/api/generate",
+                json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
+            ) as resp:
+                if resp.status != 200:
+                    log(f"LLM actions: Ollama HTTP {resp.status}")
+                    return []
+                data = await resp.json()
+                raw = data.get("response", "").strip()
+                # Strip optional markdown fences
+                if "```" in raw:
+                    raw = raw.split("```")[1]
+                    if raw.startswith("json"):
+                        raw = raw[4:]
+                    raw = raw.strip()
+                actions = json.loads(raw)
+                # Validate: only allow entity_ids that actually exist in HA
+                validated = [
+                    a for a in actions
+                    if isinstance(a, dict)
+                    and a.get("entity_id") in valid_ids
+                    and isinstance(a.get("service"), str)
+                    and "." in a["service"]
+                ]
+                if len(validated) < len(actions):
+                    log(f"LLM actions: {len(actions) - len(validated)} action(s) dropped (unknown entity_id)")
+                return validated
+    except (json.JSONDecodeError, ValueError) as exc:
+        log(f"LLM actions: could not parse Ollama response as JSON: {exc}")
+        return []
+    except asyncio.TimeoutError:
+        log(f"LLM actions: Ollama timeout for {entity_id}")
+        return []
+    except Exception as exc:
+        log(f"LLM actions: error for {entity_id}: {exc}")
+        return []
+
+
 async def _ollama_background_task(
     entity_id: str,
     friendly: str,
@@ -366,12 +529,30 @@ async def _ollama_background_task(
     reason: str,
     timestamp: str,
 ) -> None:
-    """Fire-and-forget wrapper: calls Ollama and logs the result when ready."""
+    """Fire-and-forget wrapper: calls Ollama for explanation and optional LLM-driven actions."""
     explanation = await _call_ollama(
         entity_id, friendly, domain, prev_val, new_val, unit, score, label, reason
     )
     if explanation:
         log(f"[LLM] {timestamp} {friendly}: {explanation}")
+
+    if LLM_ACTIONS_ENABLED:
+        available = await _fetch_ha_states(LLM_ACTIONS_DOMAINS)
+        if not available:
+            log("LLM actions: no controllable entities found, skipping")
+            return
+        actions = await _ask_llm_for_actions(
+            entity_id, friendly, prev_val, new_val, reason, available
+        )
+        if not actions:
+            log(f"[LLM] No actions decided for {entity_id}")
+            return
+        for action in actions:
+            target = action["entity_id"]
+            svc = action["service"]
+            extra = json.dumps(action.get("service_data", {})) if action.get("service_data") else ""
+            log(f"[LLM] Action: {svc} on {target}")
+            await _call_ha_service(svc, target, extra)
 
 
 # ---------------------------------------------------------------------------
@@ -448,8 +629,19 @@ class HAMonitor:
         log(f"Watching domains: {sorted(WATCHED_DOMAINS)}")
         log(f"Output directory: {OUTPUT_DIR}")
         log(f"Score threshold: {SCORE_MIN_THRESHOLD} (recording changes with score >= {SCORE_MIN_THRESHOLD})")
+        if AUTOMATIONS:
+            log(f"Automations loaded: {len(AUTOMATIONS)} rule(s)")
+            for r in AUTOMATIONS:
+                log(f"  rule: entity contains '{r.get('trigger_keyword')}' + state='{r.get('trigger_state')}' → {r.get('action_service')} on '{r.get('action_target', '')}'")
+        else:
+            log("No automations configured.")
+
         if OLLAMA_ENABLED:
             log(f"Ollama enabled: {OLLAMA_URL}  model={OLLAMA_MODEL}  threshold={OLLAMA_SCORE_THRESHOLD}  lang={OLLAMA_LANGUAGE}")
+            if LLM_ACTIONS_ENABLED:
+                log(f"LLM actions enabled — controllable domains: {sorted(LLM_ACTIONS_DOMAINS)}")
+            else:
+                log("LLM actions disabled (set llm_actions_enabled: true to let the LLM control entities)")
             available = await _fetch_ollama_models()
             if available:
                 log(f"Ollama available models: {', '.join(available)}")
@@ -557,6 +749,19 @@ class HAMonitor:
 
         if LOG_STDOUT:
             log(describe_change(friendly, entity_id, prev_val, new_val, unit, score, label, reason))
+
+        for rule in AUTOMATIONS:
+            kw = rule.get("trigger_keyword", "").lower()
+            ts = rule.get("trigger_state", "").lower()
+            if kw and kw in entity_id.lower() and ts and new_val.lower() == ts:
+                svc = rule.get("action_service", "")
+                if svc:
+                    log(f"Automation triggered: '{kw}'='{ts}' → {svc}")
+                    asyncio.create_task(_call_ha_service(
+                        svc,
+                        rule.get("action_target", ""),
+                        rule.get("action_data", ""),
+                    ))
 
         if OLLAMA_ENABLED and score >= OLLAMA_SCORE_THRESHOLD:
             asyncio.create_task(_ollama_background_task(
