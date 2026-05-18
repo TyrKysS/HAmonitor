@@ -30,8 +30,10 @@ options:
     - input_number
   output_dir: "/share/ha_monitor"
   log_to_stdout: true
+  score_min_threshold: 0
 schema:
   domains:
     - str
   output_dir: str
   log_to_stdout: bool
+  score_min_threshold: int

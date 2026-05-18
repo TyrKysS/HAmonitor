@@ -9,6 +9,9 @@ CSV columns:
   previous_state  — state before the change
   new_state       — state after the change
   unit            — unit of measurement (if available, else empty)
+  score           — significance score 0–10 (0 = no change, 10 = maximum)
+  score_label     — human-readable tier: Negligible/Low/Moderate/Significant/High/Critical
+  score_reason    — short explanation of why this score was assigned
   annotation      — intentionally empty; filled by the user after export
 """
 
@@ -30,13 +33,12 @@ HA_TOKEN: str = os.environ.get("HA_TOKEN", "")
 HA_WS_URL: str = "ws://supervisor/core/websocket"
 OUTPUT_DIR: Path = Path(os.environ.get("MONITOR_OUTPUT_DIR", "/share/ha_monitor"))
 LOG_STDOUT: bool = os.environ.get("MONITOR_LOG_STDOUT", "true").lower() == "true"
+SCORE_MIN_THRESHOLD: int = int(os.environ.get("MONITOR_SCORE_MIN_THRESHOLD", "0"))
 
-# Domains to watch — read from env as JSON array string produced by bashio
 _raw_domains = os.environ.get("MONITOR_DOMAINS", '["sensor","binary_sensor"]')
 try:
     WATCHED_DOMAINS: set[str] = set(json.loads(_raw_domains))
 except json.JSONDecodeError:
-    # bashio may emit them space-separated without brackets
     WATCHED_DOMAINS = set(_raw_domains.replace("[", "").replace("]", "").replace('"', "").split())
 
 CSV_HEADER = [
@@ -47,8 +49,220 @@ CSV_HEADER = [
     "previous_state",
     "new_state",
     "unit",
+    "score",
+    "score_label",
+    "score_reason",
     "annotation",
 ]
+
+# ---------------------------------------------------------------------------
+# Scoring engine
+# ---------------------------------------------------------------------------
+
+_SCORE_LABELS = {
+    0: "Negligible",
+    1: "Low",
+    2: "Low",
+    3: "Moderate",
+    4: "Moderate",
+    5: "Significant",
+    6: "Significant",
+    7: "High",
+    8: "High",
+    9: "Critical",
+    10: "Critical",
+}
+
+# Keywords checked against the lower-cased entity_id
+_PRESENCE_KEYWORDS = ("presence", "occupancy", "person", "people")
+_MOTION_KEYWORDS = ("motion", "movement", "pir", "vibration")
+_DOOR_KEYWORDS = ("door", "gate", "hatch", "entry", "entrance")
+_WINDOW_KEYWORDS = ("window",)
+_SMOKE_KEYWORDS = ("smoke", "fire", "co2_alarm", "gas")
+_FLOOD_KEYWORDS = ("flood", "leak", "water_sensor")
+_TEMP_UNITS = {"°c", "°f", "c", "f", "celsius", "fahrenheit"}
+_HUMID_KEYWORDS = ("humidity", "humid")
+_CO2_KEYWORDS = ("co2", "co_2", "carbon_dioxide", "voc", "pm2", "pm10", "air_quality")
+_ILLUMINANCE_KEYWORDS = ("illuminance", "lux", "light_level")
+
+
+def _score_label(score: int) -> str:
+    return _SCORE_LABELS.get(max(0, min(10, score)), "Unknown")
+
+
+def _score_temperature_delta(delta: float, unit: str) -> tuple[int, str]:
+    """Score a numeric temperature change."""
+    # Convert Fahrenheit delta to Celsius equivalent for uniform thresholds
+    if unit.lower() in ("°f", "f", "fahrenheit"):
+        delta_c = delta / 1.8
+    else:
+        delta_c = delta
+
+    if delta_c < 0.5:
+        score = 0
+    elif delta_c < 1.0:
+        score = 1
+    elif delta_c < 2.0:
+        score = 2
+    elif delta_c < 5.0:
+        score = 4
+    else:
+        score = 6
+
+    return score, f"Δtemp={delta:.2g}{unit}"
+
+
+def _score_humidity_delta(delta: float) -> tuple[int, str]:
+    if delta < 1.0:
+        return 0, f"Δhum={delta:.1f}%"
+    if delta < 3.0:
+        return 1, f"Δhum={delta:.1f}%"
+    if delta < 7.0:
+        return 3, f"Δhum={delta:.1f}%"
+    return 5, f"Δhum={delta:.1f}%"
+
+
+def _score_co2_delta(delta: float, unit: str) -> tuple[int, str]:
+    """Score air-quality sensor changes (CO2 in ppm, VOC, etc.)."""
+    if delta < 50:
+        return 1, f"Δair={delta:.0f}{unit}"
+    if delta < 200:
+        return 3, f"Δair={delta:.0f}{unit}"
+    if delta < 500:
+        return 5, f"Δair={delta:.0f}{unit}"
+    return 7, f"Δair={delta:.0f}{unit}"
+
+
+def score_change(
+    entity_id: str,
+    domain: str,
+    prev_val: str,
+    new_val: str,
+    unit: str,
+) -> tuple[int, str]:
+    """Return (score 0–10, reason) for a state transition.
+
+    Rules are evaluated top-to-bottom; first match wins.
+    """
+    eid = entity_id.lower()
+    unit_stripped = unit.strip()
+    unit_low = unit_stripped.lower()
+    new_low = new_val.lower()
+
+    # --- Safety/security events — always top priority ---
+
+    if domain == "alarm_control_panel":
+        return 10, f"alarm: {prev_val} → {new_val}"
+
+    if any(kw in eid for kw in _SMOKE_KEYWORDS):
+        if new_low in ("detected", "on", "true", "1"):
+            return 10, "smoke/fire/gas detected"
+        return 7, "smoke/fire/gas cleared"
+
+    if any(kw in eid for kw in _FLOOD_KEYWORDS):
+        if new_low in ("detected", "on", "true", "1"):
+            return 10, "flood/leak detected"
+        return 7, "flood/leak cleared"
+
+    # --- Presence & motion ---
+
+    if any(kw in eid for kw in _PRESENCE_KEYWORDS):
+        return 10, "presence/occupancy change"
+
+    if any(kw in eid for kw in _MOTION_KEYWORDS):
+        if new_low in ("detected", "on", "true", "1"):
+            return 10, "motion detected"
+        return 7, "motion cleared"
+
+    # --- Access points ---
+
+    if domain == "lock":
+        if new_low == "unlocked":
+            return 9, "lock opened"
+        return 7, "lock secured"
+
+    if any(kw in eid for kw in _DOOR_KEYWORDS):
+        if new_low in ("open", "on", "true", "1"):
+            return 8, "door/gate opened"
+        return 6, "door/gate closed"
+
+    if any(kw in eid for kw in _WINDOW_KEYWORDS):
+        if new_low in ("open", "on", "true", "1"):
+            return 7, "window opened"
+        return 5, "window closed"
+
+    # --- Climate / comfort sensors (numeric) ---
+
+    try:
+        prev_num = float(prev_val)
+        new_num = float(new_val)
+        delta = abs(new_num - prev_num)
+
+        if unit_low in _TEMP_UNITS:
+            return _score_temperature_delta(delta, unit_stripped)
+
+        if unit_low == "%" and any(kw in eid for kw in _HUMID_KEYWORDS):
+            return _score_humidity_delta(delta)
+
+        if any(kw in eid for kw in _CO2_KEYWORDS):
+            return _score_co2_delta(delta, unit_stripped)
+
+        if any(kw in eid for kw in _ILLUMINANCE_KEYWORDS):
+            if delta < 20:
+                return 0, f"Δlux={delta:.0f}"
+            if delta < 100:
+                return 1, f"Δlux={delta:.0f}"
+            return 3, f"Δlux={delta:.0f}"
+
+        # Generic numeric — score proportional to relative change
+        if prev_num != 0:
+            rel = delta / abs(prev_num)
+            if rel < 0.01:
+                return 0, f"Δ={delta:.3g} {unit_stripped}".strip()
+            if rel < 0.05:
+                return 1, f"Δ={delta:.3g} {unit_stripped}".strip()
+            if rel < 0.15:
+                return 2, f"Δ={delta:.3g} {unit_stripped}".strip()
+            return 3, f"Δ={delta:.3g} {unit_stripped}".strip()
+        else:
+            # Previous was 0 — any change is notable
+            return 3, f"Δ={delta:.3g} {unit_stripped}".strip()
+
+    except (ValueError, TypeError):
+        pass
+
+    # --- Non-numeric / binary / enumerated states ---
+
+    if domain in ("light", "switch", "input_boolean"):
+        if new_low in ("on", "true", "1"):
+            return 5, f"{domain} turned on"
+        return 4, f"{domain} turned off"
+
+    if domain == "climate":
+        return 7, f"climate mode: {prev_val} → {new_val}"
+
+    if domain == "cover":
+        if new_low in ("open", "opening"):
+            return 5, "cover opening"
+        return 4, "cover closing/closed"
+
+    if domain == "media_player":
+        if new_low == "playing":
+            return 4, "playback started"
+        if new_low in ("idle", "off"):
+            return 3, "playback stopped"
+        return 3, f"media: {prev_val} → {new_val}"
+
+    if domain == "input_select":
+        return 3, f"option: {prev_val} → {new_val}"
+
+    if domain == "binary_sensor":
+        if new_low in ("on", "true", "detected", "1"):
+            return 5, f"binary on: {new_val}"
+        return 4, f"binary off: {new_val}"
+
+    return 3, f"state: {prev_val} → {new_val}"
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -56,36 +270,29 @@ CSV_HEADER = [
 
 def log(message: str) -> None:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    line = f"[{ts}] {message}"
-    print(line, flush=True)
+    print(f"[{ts}] {message}", flush=True)
 
 
 def today_csv_path() -> Path:
-    """Return the path for today's CSV file (rotates at midnight UTC)."""
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     return OUTPUT_DIR / f"ha_monitor_{date_str}.csv"
 
 
 def ensure_csv_header(path: Path) -> None:
-    """Create the CSV with a header row if it does not yet exist."""
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(CSV_HEADER)
+            csv.writer(f).writerow(CSV_HEADER)
 
 
 def append_row(row: dict) -> None:
-    """Append one change record to today's CSV."""
     path = today_csv_path()
     ensure_csv_header(path)
     with path.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_HEADER)
-        writer.writerow(row)
+        csv.DictWriter(f, fieldnames=CSV_HEADER).writerow(row)
 
 
 def extract_state_info(state_obj: dict | None) -> tuple[str, str, str]:
-    """Return (state_value, friendly_name, unit) from a HA state object."""
     if state_obj is None:
         return "unknown", "", ""
     state_val = state_obj.get("state", "unknown")
@@ -95,11 +302,20 @@ def extract_state_info(state_obj: dict | None) -> tuple[str, str, str]:
     return state_val, friendly, unit
 
 
-def describe_change(friendly: str, entity_id: str, prev: str, new: str, unit: str) -> str:
-    """Return a human-readable one-line description of the state change."""
+def describe_change(
+    friendly: str,
+    entity_id: str,
+    prev: str,
+    new: str,
+    unit: str,
+    score: int,
+    label: str,
+    reason: str,
+) -> str:
     unit_str = f" {unit}" if unit else ""
     return (
-        f"{friendly} ({entity_id}): {prev}{unit_str} → {new}{unit_str}"
+        f"[{score:2d}/{label:11s}] {friendly} ({entity_id}): "
+        f"{prev}{unit_str} → {new}{unit_str}  ({reason})"
     )
 
 
@@ -121,6 +337,7 @@ class HAMonitor:
         log(f"Connecting to {HA_WS_URL}")
         log(f"Watching domains: {sorted(WATCHED_DOMAINS)}")
         log(f"Output directory: {OUTPUT_DIR}")
+        log(f"Score threshold: {SCORE_MIN_THRESHOLD} (recording changes with score >= {SCORE_MIN_THRESHOLD})")
 
         backoff = 5
         while True:
@@ -136,19 +353,16 @@ class HAMonitor:
     async def _connect(self) -> None:
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(HA_WS_URL) as ws:
-                # Step 1 — receive auth_required
                 msg = await ws.receive_json()
                 if msg.get("type") != "auth_required":
                     raise RuntimeError(f"Unexpected initial message: {msg}")
 
-                # Step 2 — authenticate
                 await ws.send_json({"type": "auth", "access_token": HA_TOKEN})
                 msg = await ws.receive_json()
                 if msg.get("type") != "auth_ok":
                     raise RuntimeError(f"Authentication failed: {msg}")
                 log("Authenticated with Home Assistant.")
 
-                # Step 3 — subscribe to state_changed events
                 sub_id = self._next_id()
                 await ws.send_json({
                     "id": sub_id,
@@ -160,7 +374,6 @@ class HAMonitor:
                     raise RuntimeError(f"Subscription failed: {msg}")
                 log("Subscribed to state_changed events. Monitoring started.")
 
-                # Step 4 — event loop
                 async for raw in ws:
                     if raw.type == aiohttp.WSMsgType.TEXT:
                         await self._handle_message(json.loads(raw.data))
@@ -188,14 +401,18 @@ class HAMonitor:
         prev_val, friendly, unit = extract_state_info(old_state_obj)
         new_val, friendly_new, unit_new = extract_state_info(new_state_obj)
 
-        # Prefer the new state's friendly name (entity may have been renamed)
         if friendly_new:
             friendly = friendly_new
         if unit_new:
             unit = unit_new
 
-        # Skip if no actual state change (attribute-only updates)
         if prev_val == new_val:
+            return
+
+        score, reason = score_change(entity_id, domain, prev_val, new_val, unit)
+        label = _score_label(score)
+
+        if score < SCORE_MIN_THRESHOLD:
             return
 
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -208,13 +425,16 @@ class HAMonitor:
             "previous_state": prev_val,
             "new_state": new_val,
             "unit": unit,
+            "score": score,
+            "score_label": label,
+            "score_reason": reason,
             "annotation": "",
         }
 
         append_row(row)
 
         if LOG_STDOUT:
-            log(describe_change(friendly, entity_id, prev_val, new_val, unit))
+            log(describe_change(friendly, entity_id, prev_val, new_val, unit, score, label, reason))
 
 
 # ---------------------------------------------------------------------------
