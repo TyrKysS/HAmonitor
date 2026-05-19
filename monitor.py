@@ -19,6 +19,7 @@ import asyncio
 import csv
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -519,6 +520,8 @@ async def _ask_llm_for_actions(
                     return []
                 data = await resp.json()
                 raw = data.get("response", "").strip()
+                # Remove <think>...</think> blocks (qwen3 and similar models)
+                raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
                 # Strip optional markdown fences
                 if "```" in raw:
                     parts = raw.split("```")
@@ -526,12 +529,12 @@ async def _ask_llm_for_actions(
                     if raw.startswith("json"):
                         raw = raw[4:]
                     raw = raw.strip()
-                # Extract first JSON array if LLM added prose around it
+                # Find start of JSON array and decode only that — tolerates trailing prose
                 start = raw.find("[")
-                end = raw.rfind("]")
-                if start != -1 and end != -1:
-                    raw = raw[start:end + 1]
-                actions = json.loads(raw)
+                if start == -1:
+                    log(f"LLM actions: no JSON array in response: {raw[:200]!r}")
+                    return []
+                actions, _ = json.JSONDecoder().raw_decode(raw, start)
                 validated = []
                 for a in actions:
                     if not isinstance(a, dict):
